@@ -157,6 +157,12 @@
 </head>
 <body>
 
+<!-- Sync status bar -->
+<div id="sync-bar" style="position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;align-items:center;justify-content:center;gap:8px;padding:7px 16px;font-size:13px;font-weight:600;background:#1e293b;color:#fff;transform:translateY(-100%);transition:transform .3s ease;">
+  <span id="sync-icon">⏳</span>
+  <span id="sync-msg">Syncing…</span>
+</div>
+
 <div class="page-header">
   <div class="org">Love Life Retreat · Ormoc City</div>
   <h1>Batch 1 Finance Worksheet</h1>
@@ -1071,6 +1077,315 @@ renderServants();
 renderMaterials(stationeries,'mat-stationeries');
 renderMaterials(programNeeds,'mat-program');
 recalcAll();
+
+// ═══════════════════════════════════════════════════════════════
+// GOOGLE SHEETS SYNC
+// ═══════════════════════════════════════════════════════════════
+const APPS_SCRIPT_URL = 'https://script.google.com/a/macros/thefeastormoc.org/s/AKfycbyapkIi4WFa89D9cp3vwatOa_Da0eQSttZNH27LUVmsmBz_Qz0BUBRxvx6SoJPL5lpF/exec';
+let saveTimer = null;
+let isSyncing = false;
+
+// ── Show / hide sync bar ──────────────────────────────────────
+function showSync(icon, msg, color, autohide){
+  const bar = document.getElementById('sync-bar');
+  document.getElementById('sync-icon').textContent = icon;
+  document.getElementById('sync-msg').textContent  = msg;
+  bar.style.background   = color || '#1e293b';
+  bar.style.transform    = 'translateY(0)';
+  if(autohide) setTimeout(()=>{ bar.style.transform='translateY(-100%)'; }, autohide);
+}
+function hideSync(){ document.getElementById('sync-bar').style.transform='translateY(-100%)'; }
+
+// ── Collect all form data into one JSON object ────────────────
+function collectData(){
+  const get = id => { const el=document.getElementById(id); return el ? el.value : ''; };
+
+  // Income rows
+  const incomeRows=[];
+  document.querySelectorAll('#income-table tbody tr').forEach(tr=>{
+    const ins=[...tr.querySelectorAll('input')];
+    if(ins.length>=3) incomeRows.push({src:ins[0].value, notes:ins[1].value, amt:ins[2].value});
+  });
+
+  // Actuals rows
+  const actualsRows=[];
+  document.querySelectorAll('#actuals-table tbody tr').forEach(tr=>{
+    const ins=[...tr.querySelectorAll('input')];
+    if(ins.length>=3) actualsRows.push({item:ins[0].value, notes:ins[1].value, amt:ins[2].value});
+  });
+
+  // Meal rows helper
+  function mealState(prefix){
+    const row=document.getElementById(prefix+'-row');
+    if(!row) return null;
+    const cb=row.querySelector('.meal-toggle');
+    return {
+      checked: cb ? cb.checked : false,
+      pax: get(prefix+'-pax'),
+      rate: get(prefix+'-rate')
+    };
+  }
+
+  // Transport rows
+  const transportRows=[];
+  document.querySelectorAll('#transport-table tbody tr').forEach(tr=>{
+    const ins=[...tr.querySelectorAll('input')];
+    if(ins.length>=3) transportRows.push({desc:ins[0].value, vans:ins[1].value, rate:ins[2].value});
+  });
+
+  // Food rows
+  const foodRows=[];
+  document.querySelectorAll('#food-table tbody tr').forEach(tr=>{
+    const ins=[...tr.querySelectorAll('input')];
+    if(ins.length>=3) foodRows.push({item:ins[0].value, qty:ins[1].value, rate:ins[2].value});
+  });
+
+  // Other payables rows
+  const otherRows=[];
+  document.querySelectorAll('#other-table tbody tr').forEach(tr=>{
+    const ins=[...tr.querySelectorAll('input')];
+    if(ins.length>=4) otherRows.push({item:ins[0].value, notes:ins[1].value, qty:ins[2].value, rate:ins[3].value});
+  });
+
+  // Servants
+  const servants = servantsData.map(s=>({name:s.name, notes:s.notes}));
+
+  return {
+    v: 1, // schema version
+    ts: new Date().toISOString(),
+    sliders: {
+      pax:        get('pax-slider'),
+      subsidy:    get('subsidy-slider'),
+      buffer:     get('buffer-slider'),
+      churchsub:  get('churchsub-slider')
+    },
+    income:    incomeRows,
+    actuals:   actualsRows,
+    meals: {
+      d0: { breakfast:mealState('m-d0-breakfast'), lunch:mealState('m-d0-lunch'), dinner:mealState('m-d0-dinner'), snack1:mealState('m-d0-snack1'), snack2:mealState('m-d0-snack2') },
+      d1: { breakfast:mealState('m-d1-breakfast'), lunch:mealState('m-d1-lunch'), dinner:mealState('m-d1-dinner'), snack1:mealState('m-d1-snack1'), snack2:mealState('m-d1-snack2'), accom:mealState('m-d1-accom') },
+      d2: { breakfast:mealState('m-d2-breakfast'), lunch:mealState('m-d2-lunch'), dinner:mealState('m-d2-dinner'), snack1:mealState('m-d2-snack1'), snack2:mealState('m-d2-snack2') }
+    },
+    transport: transportRows,
+    food:      foodRows,
+    other:     otherRows,
+    servants:  servants
+  };
+}
+
+// ── Restore all form data from a JSON object ──────────────────
+function restoreData(data){
+  if(!data || !data.v) return;
+
+  // Sliders
+  if(data.sliders){
+    const s=data.sliders;
+    ['pax','subsidy','buffer','churchsub'].forEach(k=>{
+      const el=document.getElementById(k+'-slider');
+      if(el && s[k]!==undefined) el.value=s[k];
+    });
+    updatePaxLabel(); updateSubsidyLabel(); updateBufferLabel(); updateChurchSubLabel();
+  }
+
+  // Income rows
+  if(data.income && data.income.length){
+    const tb=document.querySelector('#income-table tbody');
+    tb.innerHTML='';
+    data.income.forEach(r=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td><input type="text" value="${esc(r.src)}"/></td><td><input type="text" value="${esc(r.notes)}"/></td><td><input type="number" min="0" step="1" value="${esc(r.amt)}" class="income-input" oninput="schedSave();recalcAll()"/></td><td><button class="remove-btn" onclick="removeRow(this)">✕</button></td>`;
+      tb.appendChild(tr);
+    });
+  }
+
+  // Actuals rows
+  if(data.actuals && data.actuals.length){
+    const tb=document.querySelector('#actuals-table tbody');
+    tb.innerHTML='';
+    data.actuals.forEach(r=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td><input type="text" value="${esc(r.item)}"/></td><td><input type="text" value="${esc(r.notes)}"/></td><td><input type="number" min="0" step="1" value="${esc(r.amt)}" class="actual-input" oninput="schedSave();recalcAll()"/></td><td><button class="remove-btn" onclick="removeRow(this)">✕</button></td>`;
+      tb.appendChild(tr);
+    });
+  }
+
+  // Meal rows helper
+  function restoreMeal(prefix, state){
+    if(!state) return;
+    const row=document.getElementById(prefix+'-row');
+    if(!row) return;
+    const cb=row.querySelector('.meal-toggle');
+    const paxEl=document.getElementById(prefix+'-pax');
+    const rateEl=document.getElementById(prefix+'-rate');
+    if(cb){ cb.checked=state.checked; }
+    if(paxEl) paxEl.value=state.pax||'';
+    if(rateEl) rateEl.value=state.rate||'';
+    if(cb && !cb.checked){ row.classList.add('disabled-row'); if(paxEl)paxEl.disabled=true; if(rateEl)rateEl.disabled=true; }
+    else { row.classList.remove('disabled-row'); if(paxEl)paxEl.disabled=false; if(rateEl)rateEl.disabled=false; }
+  }
+
+  if(data.meals){
+    const m=data.meals;
+    if(m.d0){ restoreMeal('m-d0-breakfast',m.d0.breakfast); restoreMeal('m-d0-lunch',m.d0.lunch); restoreMeal('m-d0-dinner',m.d0.dinner); restoreMeal('m-d0-snack1',m.d0.snack1); restoreMeal('m-d0-snack2',m.d0.snack2); }
+    if(m.d1){ restoreMeal('m-d1-breakfast',m.d1.breakfast); restoreMeal('m-d1-lunch',m.d1.lunch); restoreMeal('m-d1-dinner',m.d1.dinner); restoreMeal('m-d1-snack1',m.d1.snack1); restoreMeal('m-d1-snack2',m.d1.snack2); restoreMeal('m-d1-accom',m.d1.accom); }
+    if(m.d2){ restoreMeal('m-d2-breakfast',m.d2.breakfast); restoreMeal('m-d2-lunch',m.d2.lunch); restoreMeal('m-d2-dinner',m.d2.dinner); restoreMeal('m-d2-snack1',m.d2.snack1); restoreMeal('m-d2-snack2',m.d2.snack2); }
+  }
+
+  // Transport rows
+  if(data.transport && data.transport.length){
+    const tb=document.querySelector('#transport-table tbody');
+    tb.innerHTML='';
+    data.transport.forEach(r=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td><input type="text" value="${esc(r.desc)}"/></td><td><input type="number" min="0" value="${esc(r.vans)}" class="t-vans" oninput="schedSave();recalcAll()"/></td><td><input type="number" min="0" value="${esc(r.rate)}" class="t-rate" oninput="schedSave();recalcAll()"/></td><td class="row-total t-total">₱0</td><td><button class="remove-btn" onclick="removeRow(this)">✕</button></td>`;
+      tb.appendChild(tr);
+    });
+  }
+
+  // Food rows
+  if(data.food && data.food.length){
+    const tb=document.querySelector('#food-table tbody');
+    tb.innerHTML='';
+    data.food.forEach(r=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td><input type="text" value="${esc(r.item)}"/></td><td><input type="number" min="0" value="${esc(r.qty)}" class="f-qty" oninput="schedSave();recalcAll()"/></td><td><input type="number" min="0" value="${esc(r.rate)}" class="f-rate" oninput="schedSave();recalcAll()"/></td><td class="row-total f-total">₱0</td><td><button class="remove-btn" onclick="removeRow(this)">✕</button></td>`;
+      tb.appendChild(tr);
+    });
+  }
+
+  // Other payables
+  if(data.other && data.other.length){
+    const tb=document.querySelector('#other-table tbody');
+    tb.innerHTML='';
+    data.other.forEach(r=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${esc(r.item)}</td><td><input type="text" value="${esc(r.notes)}"/></td><td><input type="number" min="0" value="${esc(r.qty)}" class="o-qty" oninput="schedSave();recalcAll()"/></td><td><input type="number" min="0" value="${esc(r.rate)}" class="o-rate" oninput="schedSave();recalcAll()"/></td><td class="row-total o-total">₱0</td><td><button class="remove-btn" onclick="removeRow(this)">✕</button></td>`;
+      tb.appendChild(tr);
+    });
+  }
+
+  // Servants
+  if(data.servants && data.servants.length){
+    servantsData.length=0;
+    data.servants.forEach(s=> servantsData.push({name:s.name||'', notes:s.notes||''}));
+    renderServants();
+  }
+
+  recalcAll();
+}
+
+// ── HTML escape helper ────────────────────────────────────────
+function esc(v){ return String(v||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Save to Google Sheets via JSONP GET ──────────────────────
+function saveToSheet(){
+  if(isSyncing) return;
+  isSyncing=true;
+  showSync('💾','Saving…','#4f46e5');
+
+  const payload = JSON.stringify(collectData());
+  const cbName  = 'llrSave_' + Date.now();
+  const script  = document.createElement('script');
+  let   done    = false;
+
+  const timer = setTimeout(()=>{
+    if(done) return;
+    done=true; cleanup();
+    isSyncing=false;
+    showSync('❌','Save timed out — check connection','#ef4444',4000);
+  }, 12000);
+
+  window[cbName] = function(resp){
+    if(done) return;
+    done=true; clearTimeout(timer); cleanup();
+    isSyncing=false;
+    delete window[cbName];
+    if(resp && resp.status==='ok'){
+      showSync('✅','Saved — all changes synced','#10b981',2500);
+    } else {
+      showSync('❌','Save failed: '+(resp&&resp.error||'unknown'),'#ef4444',4000);
+    }
+  };
+
+  script.onerror = function(){
+    if(done) return;
+    done=true; clearTimeout(timer); cleanup();
+    isSyncing=false;
+    showSync('❌','Save failed — check connection','#ef4444',4000);
+    delete window[cbName];
+  };
+
+  function cleanup(){ if(script.parentNode) script.parentNode.removeChild(script); }
+
+  // Pass data as URL param — Apps Script GET handles action=save
+  script.src = APPS_SCRIPT_URL
+    + '?callback=' + cbName
+    + '&action=save'
+    + '&data=' + encodeURIComponent(payload)
+    + '&t=' + Date.now();
+  document.head.appendChild(script);
+}
+
+// ── Load from Google Sheets via JSONP (bypasses CORS on GET) ──
+function loadFromSheet(){
+  showSync('⏳','Loading data…','#1e293b');
+  const cbName = 'llrCallback_' + Date.now();
+  const script = document.createElement('script');
+  let   done   = false;
+
+  const timer = setTimeout(()=>{
+    if(done) return;
+    done=true;
+    cleanup();
+    showSync('⚠️','Could not load — working offline','#f59e0b',4000);
+  }, 10000);
+
+  window[cbName] = function(data){
+    if(done) return;
+    done=true;
+    clearTimeout(timer);
+    cleanup();
+    if(data && data.v){
+      restoreData(data);
+      showSync('✅','Data loaded','#10b981',2000);
+    } else {
+      hideSync(); // no data saved yet — fresh sheet
+    }
+    delete window[cbName];
+  };
+
+  function cleanup(){ if(script.parentNode) script.parentNode.removeChild(script); }
+
+  script.onerror = function(){
+    if(done) return;
+    done=true;
+    clearTimeout(timer);
+    cleanup();
+    showSync('⚠️','Could not load — working offline','#f59e0b',4000);
+    delete window[cbName];
+  };
+
+  script.src = APPS_SCRIPT_URL + '?callback=' + cbName + '&t=' + Date.now();
+  document.head.appendChild(script);
+}
+
+// ── Schedule a debounced save (1.5s after last change) ────────
+function schedSave(){
+  clearTimeout(saveTimer);
+  showSync('✏️','Unsaved changes…','#64748b');
+  saveTimer=setTimeout(saveToSheet, 1500);
+}
+
+// ── Wire schedSave into every input / change in the page ──────
+function wireAutoSave(){
+  document.addEventListener('input',  e=>{ if(e.target.matches('input,select,textarea')) schedSave(); });
+  document.addEventListener('change', e=>{ if(e.target.matches('input[type="checkbox"]'))  schedSave(); });
+}
+
+
+// ── Boot: wire auto-save then load from sheet ─────────────────
+wireAutoSave();
+loadFromSheet();
 </script>
 </body>
 </html>
